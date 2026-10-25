@@ -7,10 +7,24 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+# PDF parsing: try pypdf first, then pdfminer.six, then built-in stream parser
 try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
+try:
+    from pdfminer.high_level import extract_text as pdfminer_extract
+except ImportError:
+    pdfminer_extract = None
+
+# Image/OCR: try pytesseract + PIL for PNG screenshots, graceful fallback
+try:
+    from PIL import Image
+    import pytesseract
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "output.csv"
@@ -166,7 +180,10 @@ class EnhancedAuditor:
                 self.email_to_uid[em] = uid
             if u.get("name"): self.user_names[uid].add(u["name"])
             if u.get("phone"): self.user_phones[uid].add(u["phone"])
-            if u.get("email_hash"): self.user_hashes[uid].add(norm(u["email_hash"]))
+            # Flaw 5 fix: normalise hash (strip whitespace + casefold)
+            if u.get("email_hash"):
+                h = str(u["email_hash"]).strip().casefold()
+                self.user_hashes[uid].add(h)
 
         for a in self.audit_log:
             uid = a["user_id"]
@@ -187,7 +204,9 @@ class EnhancedAuditor:
                     if val: self.user_phones[uid].add(val)
             elif field == "email_hash":
                 for val in [old_val, new_val]:
-                    if val: self.user_hashes[uid].add(norm(val))
+                    if val:
+                        h = str(val).strip().casefold()
+                        self.user_hashes[uid].add(h)
 
         # Process system activity deletion worker submissions
         self.primary_acts = []
@@ -224,6 +243,8 @@ class EnhancedAuditor:
                 self._load_text(p, eid, cap_at)
             elif suffix == ".pdf":
                 self._load_pdf(p, eid, cap_at)
+            elif suffix == ".png":  # Flaw 6 fix: parse screenshot images
+                self._load_image(p, eid, cap_at)
 
     def _load_json(self, p: Path, eid: str, cap_at: Optional[datetime]):
         try:
@@ -672,14 +693,24 @@ class EnhancedAuditor:
             self._add_record(rid, sysid, cat, state, eid, line_dt, ids, line_str)
 
     def _extract_pdf_text(self, p: Path) -> str:
+        # 1. Try pypdf (best quality)
         if PdfReader:
             try:
                 reader = PdfReader(p)
-                t = " ".join(page.extract_text() for page in reader.pages)
+                t = " ".join(page.extract_text() or "" for page in reader.pages)
                 if t and len(t.strip()) > 50:
                     return t
             except Exception:
                 pass
+        # 2. Try pdfminer.six (Flaw 4 fix)
+        if pdfminer_extract:
+            try:
+                t = pdfminer_extract(str(p))
+                if t and len(t.strip()) > 50:
+                    return t
+            except Exception:
+                pass
+        # 3. Built-in pure-Python zlib/stream fallback
         try:
             content = p.read_bytes()
         except Exception:
@@ -723,6 +754,39 @@ class EnhancedAuditor:
             pos = end + 9
         return " ".join(all_text)
 
+    def _load_image(self, p: Path, eid: str, cap_at: Optional[datetime]):
+        """Flaw 6 fix: Parse PNG screenshots via OCR (pytesseract) or pixel-free stub."""
+        text = ""
+        if _OCR_AVAILABLE:
+            try:
+                img = Image.open(p)
+                text = pytesseract.image_to_string(img)
+            except Exception:
+                pass
+        if not text or len(text.strip()) < 10:
+            # No OCR available or no text found — log the image as evidence
+            # but do not fabricate findings from it.
+            return
+        raw_rids = RESOURCE_RE.findall(text)
+        rids = [r for r in raw_rids if is_valid_resource_id(r)]
+        emails = EMAIL_RE.findall(text)
+        users = USER_RE.findall(text)
+        ids: Dict[str, Any] = {}
+        if emails:
+            ids["email"] = emails[0]
+        if users:
+            ids["user_id"] = users[0]
+        for rid in set(rids):
+            sysid = get_system_id(rid)
+            cat = "UNKNOWN"
+            if rid.startswith("account_"):     cat = "USER_PROFILE"
+            elif rid.startswith("analytics_"): cat = "ANALYTICS_PROFILE"
+            elif rid.startswith("search_"):    cat = "SEARCH_INDEX_ENTRY"
+            elif rid.startswith("support_"):   cat = "SUPPORT_MESSAGE"
+            elif rid.startswith("backup_"):    cat = "BACKUP_ARCHIVE"
+            elif rid.startswith("data_flow_"): cat = "DATA_FLOW"
+            self._add_record(rid, sysid, cat, "PRESENT", eid, cap_at, ids, text[:300])
+
     def _load_pdf(self, p: Path, eid: str, cap_at: Optional[datetime]):
         text = self._extract_pdf_text(p)
         if not text:
@@ -747,40 +811,64 @@ class EnhancedAuditor:
         self.by_user_id = defaultdict(list)
         self.by_hash = defaultdict(list)
         self.by_resource = defaultdict(list)
+        # Flaw 5 fix: also build phone and name indexes for better resolution
+        self.by_phone = defaultdict(list)
+        self.by_name = defaultdict(list)
         for rec in self.records:
             ids = rec["identifiers"]
-            if ids.get("email"): self.by_email[norm(ids["email"])].append(rec)
-            if ids.get("user_id"): self.by_user_id[norm(ids["user_id"])].append(rec)
-            if ids.get("email_hash"): self.by_hash[norm(ids["email_hash"])].append(rec)
+            if ids.get("email"):      self.by_email[norm(ids["email"])].append(rec)
+            if ids.get("user_id"):    self.by_user_id[norm(ids["user_id"])].append(rec)
+            # Flaw 5 fix: normalise hash before indexing
+            if ids.get("email_hash"):
+                h = str(ids["email_hash"]).strip().casefold()
+                self.by_hash[h].append(rec)
+            if ids.get("phone"):      self.by_phone[norm(ids["phone"])].append(rec)
+            if ids.get("name"):       self.by_name[norm(ids["name"])].append(rec)
             self.by_resource[norm(rec["resource_id"])].append(rec)
+
+    def _find_account_for_uid(self, uid: Optional[str]) -> Optional[str]:
+        """Try to locate an account_* resource_id for this user from indexed evidence."""
+        if not uid:
+            return None
+        # By email
+        for em in self.user_emails[uid]:
+            for rec in self.by_email.get(norm(em), []):
+                rid = rec["resource_id"]
+                if rid.startswith("account_") and is_valid_resource_id(rid):
+                    return rid
+        # By user_id
+        for rec in self.by_user_id.get(norm(uid), []):
+            rid = rec["resource_id"]
+            if rid.startswith("account_") and is_valid_resource_id(rid):
+                return rid
+        # Flaw 3 fix: by phone
+        for ph in self.user_phones[uid]:
+            for rec in self.by_phone.get(norm(ph), []):
+                rid = rec["resource_id"]
+                if rid.startswith("account_") and is_valid_resource_id(rid):
+                    return rid
+        # Flaw 3 fix: by name
+        for nm in self.user_names[uid]:
+            for rec in self.by_name.get(norm(nm), []):
+                rid = rec["resource_id"]
+                if rid.startswith("account_") and is_valid_resource_id(rid):
+                    return rid
+        # Flaw 3 fix: by email hash
+        for h in self.user_hashes[uid]:
+            for rec in self.by_hash.get(h, []):
+                rid = rec["resource_id"]
+                if rid.startswith("account_") and is_valid_resource_id(rid):
+                    return rid
+        return None
 
     def resolve_primary_accounts(self, requests: List[Dict[str, str]]) -> Dict[str, str]:
         assigned: Dict[str, str] = {}
-        
-        # 1. Direct evidence matches
+
+        # 1. Direct evidence matches (email → uid → account, plus phone/name/hash)
         for r in requests:
             cid = r["case_id"]
             uid = self.email_to_uid.get(norm(r["email"]))
-            num_m = re.search(r"\d+", cid)
-            num = int(num_m.group(0)) if num_m else 0
-            
-            if num <= 10 and num not in [3, 9]:
-                assigned[cid] = f"account_{num:03d}"
-                continue
-                
-            found_acc = None
-            if uid:
-                for em in self.user_emails[uid]:
-                    for rec in self.by_email.get(norm(em), []):
-                        rid = rec["resource_id"]
-                        if rid.startswith("account_") and is_valid_resource_id(rid):
-                            found_acc = rid; break
-                    if found_acc: break
-                if not found_acc:
-                    for rec in self.by_user_id.get(norm(uid), []):
-                        rid = rec["resource_id"]
-                        if rid.startswith("account_") and is_valid_resource_id(rid):
-                            found_acc = rid; break
+            found_acc = self._find_account_for_uid(uid)
             if found_acc:
                 assigned[cid] = found_acc
 
@@ -788,35 +876,46 @@ class EnhancedAuditor:
         status_map = {"COMPLETE": "SUCCESS", "PARTIALLY_COMPLETE": "PARTIAL", "NOT_STARTED": "FAILED"}
         unassigned_reqs = [r for r in requests if r["case_id"] not in assigned]
 
-        batches = defaultdict(list)
+        batches: Dict[Any, list] = defaultdict(list)
         for r in unassigned_reqs:
             rep_at = parse_dt(r["reported_at"])
             batches[(rep_at, r.get("reported_status", ""))].append(r)
 
         for (rep_at, stat), b_reqs in batches.items():
-            if not rep_at: continue
+            if not rep_at:
+                continue
             target_res = status_map.get(stat)
             batch_uids = {self.email_to_uid.get(norm(r["email"])) for r in b_reqs}
-            batch_emails = {norm(r["email"]) for r in b_reqs}
+            batch_emails: Set[str] = {norm(r["email"]) for r in b_reqs}
+            batch_phones: Set[str] = set()
+            batch_names: Set[str] = set()
             for u in list(batch_uids):
                 if u:
                     batch_emails.update(self.user_emails[u])
+                    batch_phones.update(norm(p) for p in self.user_phones[u])
+                    batch_names.update(norm(n) for n in self.user_names[u])
                     batch_uids.add(u)
-                    
+
             cands = []
             for i, act in self.primary_acts:
                 rid = act["resource_id"]
-                if rid in assigned.values(): continue
-                if rid == "account_7015": continue
-                
-                # Check evidence owners
-                rec_owners = set()
-                for rec in self.by_resource.get(norm(rid), []):
-                    if rec.get("identifiers", {}).get("email"): rec_owners.add(norm(rec["identifiers"]["email"]))
-                    if rec.get("identifiers", {}).get("user_id"): rec_owners.add(norm(rec["identifiers"]["user_id"]))
-                if rec_owners and not (rec_owners & (batch_emails | batch_uids)):
+                if rid in assigned.values():
                     continue
-                    
+                # Check evidence owners (email, user_id, phone, name)
+                rec_owners_em: Set[str] = set()
+                rec_owners_uid: Set[str] = set()
+                rec_owners_ph: Set[str] = set()
+                rec_owners_nm: Set[str] = set()
+                for rec in self.by_resource.get(norm(rid), []):
+                    ids_r = rec.get("identifiers", {})
+                    if ids_r.get("email"):  rec_owners_em.add(norm(ids_r["email"]))
+                    if ids_r.get("user_id"): rec_owners_uid.add(norm(ids_r["user_id"]))
+                    if ids_r.get("phone"):  rec_owners_ph.add(norm(ids_r["phone"]))
+                    if ids_r.get("name"):   rec_owners_nm.add(norm(ids_r["name"]))
+                all_owners = rec_owners_em | rec_owners_uid | rec_owners_ph | rec_owners_nm
+                all_batch  = batch_emails | batch_uids | batch_phones | batch_names
+                if all_owners and not (all_owners & all_batch):
+                    continue
                 t = parse_dt(act["event_time"])
                 if t and abs((t - rep_at).total_seconds()) <= 7200 and act.get("reported_result") == target_res:
                     cands.append((t, rid))
@@ -824,16 +923,27 @@ class EnhancedAuditor:
             for req_item, cand in zip(b_reqs, cands):
                 assigned[req_item["case_id"]] = cand[1]
 
-        # 3. Fallback for any remaining unassigned
+        # 3. Flaw 3 fix: smarter fallback using case number only when no evidence found
+        #    Try to look up existing account IDs from the activity stream first.
+        activity_accounts = sorted(
+            {a["resource_id"] for _, a in self.primary_acts if is_valid_resource_id(a.get("resource_id", ""))}
+        )
+        used_accs = set(assigned.values())
         for r in requests:
             cid = r["case_id"]
             if cid not in assigned:
-                num_m = re.search(r"\d+", cid)
-                if num_m:
-                    assigned[cid] = f"account_{int(num_m.group(0)):03d}"
-                else:
-                    assigned[cid] = "account_001"
-                    
+                # Prefer an activity account not yet assigned
+                candidate = None
+                for acc in activity_accounts:
+                    if acc not in used_accs:
+                        candidate = acc
+                        break
+                if not candidate:
+                    num_m = re.search(r"\d+", cid)
+                    candidate = f"account_{int(num_m.group(0)):03d}" if num_m else "account_001"
+                assigned[cid] = candidate
+                used_accs.add(candidate)
+
         return assigned
 
     def audit_case(self, req: Dict[str, str], primary_acc: str) -> Dict[str, Any]:
@@ -869,24 +979,38 @@ class EnhancedAuditor:
             # Identity safety check:
             # If the record has explicit identifiers, verify they belong to this user
             rec_ids = rec.get("identifiers", {})
-            has_explicit_id = bool(rec_ids.get("email") or rec_ids.get("user_id") or rec_ids.get("email_hash"))
+            has_explicit_id = bool(
+                rec_ids.get("email") or rec_ids.get("user_id")
+                or rec_ids.get("email_hash") or rec_ids.get("phone")
+            )
             if has_explicit_id:
-                em_match = bool(rec_ids.get("email") and norm(rec_ids["email"]) in emails)
-                uid_match = bool(rec_ids.get("user_id") and uid and norm(rec_ids["user_id"]) == norm(uid))
-                hash_match = bool(rec_ids.get("email_hash") and norm(rec_ids["email_hash"]) in hashes)
-                if not (em_match or uid_match or hash_match):
+                em_match   = bool(rec_ids.get("email") and norm(rec_ids["email"]) in emails)
+                uid_match  = bool(rec_ids.get("user_id") and uid and norm(rec_ids["user_id"]) == norm(uid))
+                # Flaw 5 fix: normalise hash before comparison
+                hash_match = bool(
+                    rec_ids.get("email_hash")
+                    and str(rec_ids["email_hash"]).strip().casefold() in hashes
+                )
+                # Flaw 3 fix: also match via phone/name
+                phones = self.user_phones[uid] if uid else set()
+                names  = self.user_names[uid]  if uid else set()
+                ph_match = bool(rec_ids.get("phone") and norm(rec_ids["phone"]) in {norm(p) for p in phones})
+                nm_match = bool(rec_ids.get("name")  and norm(rec_ids["name"])  in {norm(n) for n in names})
+                if not (em_match or uid_match or hash_match or ph_match or nm_match):
                     return
-                    
+
             k = (rec["system_id"], rec["resource_id"])
-            # Prefer latest observation
+            # Flaw 1 fix: prefer the most-recent observation strictly before audit_at
             if k not in user_records_map:
                 user_records_map[k] = rec
             else:
                 existing = user_records_map[k]
                 exist_file_cap = self.evidence_dates.get(existing["evidence_id"])
                 new_file_cap = file_cap
+                # If existing is valid (<=audit_at) and new is stale (>audit_at), keep existing
                 if exist_file_cap and exist_file_cap <= audit_at and new_file_cap and new_file_cap > audit_at:
                     return
+                # If existing is stale (>audit_at) and new is valid (<=audit_at), take new
                 if exist_file_cap and exist_file_cap > audit_at and new_file_cap and new_file_cap <= audit_at:
                     user_records_map[k] = rec
                     return
@@ -898,11 +1022,21 @@ class EnhancedAuditor:
         for em in emails:
             for rec in self.by_email.get(norm(em), []):
                 add_cand(rec)
+        # Flaw 5 fix: use normalised hash key
         for h in hashes:
-            for rec in self.by_hash.get(norm(h), []):
+            for rec in self.by_hash.get(str(h).strip().casefold(), []):
                 add_cand(rec)
         if uid:
             for rec in self.by_user_id.get(norm(uid), []):
+                add_cand(rec)
+        # Flaw 3 fix: also look up by phone and name
+        phones = self.user_phones[uid] if uid else set()
+        names  = self.user_names[uid]  if uid else set()
+        for ph in phones:
+            for rec in self.by_phone.get(norm(ph), []):
+                add_cand(rec)
+        for nm in names:
+            for rec in self.by_name.get(norm(nm), []):
                 add_cand(rec)
         for rec in self.by_resource.get(norm(primary_acc), []):
             add_cand(rec)
